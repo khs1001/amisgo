@@ -3,12 +3,16 @@ package amisgo
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"testing/fstest"
+	"text/template"
 )
 
 // newFS 构造一个包含指定页面的 fstest.MapFS。
@@ -420,5 +424,189 @@ func TestNestedLayout(t *testing.T) {
 	page := mustRender(t, e, "a", map[string]any{"v": 9})
 	if page["inA"].(map[string]any)["inB"].(map[string]any)["leaf"] != json.Number("9") {
 		t.Fatalf("嵌套 include 未正确传递 data: %#v", page)
+	}
+}
+
+// ---- ErrNotFound 哨兵错误 / fail-fast 查找 ----
+
+// TestErrNotFoundSentinel 验证「无此页面」可经 errors.Is 与哨兵错误匹配，
+// 而「页面存在但坏了」不匹配哨兵（调用方据此区分 404 与 500）。
+func TestErrNotFoundSentinel(t *testing.T) {
+	e := New("", newFS(map[string]string{
+		"broken": `{"a":`, // 存在但非法
+	}))
+
+	_, err := e.Render(context.Background(), "missing", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("未命中应包装 ErrNotFound, got %v", err)
+	}
+
+	_, err = e.Render(context.Background(), "broken", nil)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("坏页面不应匹配 ErrNotFound, got %v", err)
+	}
+}
+
+// brokenFS 模拟「文件存在但读取失败（非不存在错误）」的来源：
+// 对 fail 文件返回权限类错误，对其余文件返回 ErrNotExist。
+type brokenFS struct {
+	fail string
+}
+
+func (f brokenFS) Open(name string) (fs.File, error) {
+	if name == f.fail {
+		return nil, errors.New("access is denied")
+	}
+	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+}
+
+// TestLookupFailFast 验证来源中文件存在但读取失败时报错携带来源标签，
+// 不静默跳过到下一来源（陈旧副本顶上即排查地狱）。
+func TestLookupFailFast(t *testing.T) {
+	e := New("", brokenFS{fail: "user/list.json"})
+	e.RegisterFS(newFS(map[string]string{"user/list": `{"from":"fallback"}`}))
+
+	_, err := e.Render(context.Background(), "user/list", nil)
+	if err == nil {
+		t.Fatal("读取失败应报错而非静默使用下一来源")
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("读取失败不应归类为「无此页面」: %v", err)
+	}
+	if !strings.Contains(err.Error(), "fs0") {
+		t.Fatalf("错误应携带来源标签: %v", err)
+	}
+
+	// 缺失文件返回 ErrNotExist 的来源应正常跳过（不触发 fail-fast）。
+	e2 := New("", brokenFS{fail: "other.json"})
+	e2.RegisterFS(newFS(map[string]string{"user/list": `{"from":"ok"}`}))
+	page := mustRender(t, e2, "user/list", nil)
+	if page["from"] != "ok" {
+		t.Fatalf("ErrNotExist 应跳过继续查找: %#v", page)
+	}
+}
+
+// ---- Strict 严格寻址 ----
+
+// TestStrictDisablesFallback 验证严格模式禁用同名层级回退，
+// 只按完整路径精确命中。
+func TestStrictDisablesFallback(t *testing.T) {
+	e := New("", newFS(map[string]string{
+		"list": `{"from":"short"}`,
+	})).Strict()
+
+	_, err := e.Render(context.Background(), "user/list", nil)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("严格模式下 user/list 不应回退到 list.json, got %v", err)
+	}
+
+	// 完整路径仍正常命中。
+	e2 := New("", newFS(map[string]string{
+		"user/list": `{"from":"full"}`,
+		"list":      `{"from":"short"}`,
+	})).Strict()
+	page := mustRender(t, e2, "user/list", nil)
+	if page["from"] != "full" {
+		t.Fatalf("严格模式完整路径应精确命中: %#v", page)
+	}
+}
+
+// ---- Funcs 自定义模板函数 ----
+
+// TestFuncsCustomFunc 验证调用方注册的模板函数可在特征码中调用。
+func TestFuncsCustomFunc(t *testing.T) {
+	e := New("", newFS(map[string]string{
+		"page": `{"title":"{{T ` + "`标题`" + ` | json}}"}`,
+	})).Funcs(template.FuncMap{
+		"T": func(s string) string { return "[i18n]" + s },
+	})
+
+	page := mustRender(t, e, "page", nil)
+	if page["title"] != "[i18n]标题" {
+		t.Fatalf("自定义函数未生效: %#v", page)
+	}
+}
+
+// TestFuncsBuiltinsWin 验证与内置函数同名时以内置函数为准。
+func TestFuncsBuiltinsWin(t *testing.T) {
+	e := New("", newFS(map[string]string{
+		"page": `{"v":"{{.v | json}}"}`,
+	})).Funcs(template.FuncMap{
+		"json": func(v any) string { return "hijacked" },
+	})
+
+	page := mustRender(t, e, "page", map[string]any{"v": 1})
+	if page["v"] != json.Number("1") {
+		t.Fatalf("内置 json 函数不应被覆盖: %#v", page)
+	}
+}
+
+// ---- Validate 启动期全量校验 ----
+
+// TestValidateAllPages 验证全部页面合法时返回 nil。
+func TestValidateAllPages(t *testing.T) {
+	e := New("", newFS(map[string]string{
+		"a":       `{"v":1}`,
+		"user/b":  `{"v":"{{.v | json}}"}`,
+		"deep/c":  "{\"part\":\"{{include `a` | json}}\"}",
+	}))
+	if err := e.Validate(); err != nil {
+		t.Fatalf("合法页面不应报错: %v", err)
+	}
+}
+
+// TestValidateCatchesBrokenPage 验证坏页面（JSON 或模板语法错误）被校验拦截
+// 且错误包含 sign。
+func TestValidateCatchesBrokenPage(t *testing.T) {
+	for _, broken := range []string{
+		`{"a":`,               // 非法 JSON
+		`{"a":"{{.x | json}}"`, // 渲染后引号缺失 → 非法 JSON
+		`{"a":"{{end}}"}`,      // 模板语法错误
+	} {
+		e := New("", newFS(map[string]string{"a": `{"v":1}`, "bad": broken}))
+		err := e.Validate()
+		if err == nil {
+			t.Fatalf("坏页面应使校验失败: %s", broken)
+		}
+		if !strings.Contains(err.Error(), `"bad"`) {
+			t.Fatalf("错误应包含页面 sign: %v", err)
+		}
+	}
+}
+
+// TestValidateRespectsSourcePriority 验证同一 sign 只校验优先级最高的来源
+//（低优先级来源中被遮蔽的同名页面不参与校验）。
+func TestValidateRespectsSourcePriority(t *testing.T) {
+	root := t.TempDir()
+	// 根目录的 a.json 遮蔽 fs 中的坏副本。
+	if err := os.WriteFile(filepath.Join(root, "a.json"), []byte(`{"from":"local"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e := New(root, newFS(map[string]string{"a": `{"bad":`}))
+	if err := e.Validate(); err != nil {
+		t.Fatalf("被遮蔽的坏副本不应导致校验失败: %v", err)
+	}
+
+	// 根目录自身坏文件必须被校验出。
+	root2 := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root2, "b.json"), []byte(`{"bad":`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e2 := New(root2)
+	err := e2.Validate()
+	if err == nil || !strings.Contains(err.Error(), `"b"`) {
+		t.Fatalf("根目录坏文件应使校验失败: %v", err)
+	}
+}
+
+// TestValidateSkipsNonJSON 验证非 .json 文件不参与校验。
+func TestValidateSkipsNonJSON(t *testing.T) {
+	m := fstest.MapFS{
+		"a.json":     &fstest.MapFile{Data: []byte(`{"v":1}`)},
+		"README.md":  &fstest.MapFile{Data: []byte(`这不是 JSON`)},
+		"notes.jsonx": &fstest.MapFile{Data: []byte(`也不是 JSON`)},
+	}
+	if err := New("", m).Validate(); err != nil {
+		t.Fatalf("非 .json 文件不应参与校验: %v", err)
 	}
 }

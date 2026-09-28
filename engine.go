@@ -28,13 +28,20 @@ package amisgo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/template"
 )
+
+// ErrNotFound 是「无此页面」的哨兵错误：磁盘根目录与全部已注册 fs 中都
+// 未命中目标页面时，查找错误会包装它返回，调用方可用
+// errors.Is(err, ErrNotFound) 程序化区分「无此页面」与「页面存在但坏了」。
+var ErrNotFound = errors.New("amisgo: page not found")
 
 // Hook 在每次渲染、页面解析完成之后被调用，可对 page 做最终修改。
 //
@@ -46,15 +53,52 @@ type Hook func(cxt context.Context, sign string, page map[string]any, data map[s
 // Engine 将 sign.json 页面文件渲染为 map[string]any。
 //
 // Engine 并发安全：模板与页面缓存可被多个 goroutine 同时使用。
+// Funcs/Strict 等链式设置方法应在首次 Render 前调用完成。
 type Engine struct {
-	mu      sync.RWMutex
-	root    fs.FS   // 本地根目录（os.DirFS 包装），nil 表示无本地根目录
-	fss     []fs.FS // 备用文件系统列表，按注册顺序查找
-	hooks   []Hook
+	mu     sync.RWMutex
+	root   fs.FS   // 本地根目录（os.DirFS 包装），nil 表示无本地根目录
+	fss    []fs.FS // 备用文件系统列表，按注册顺序查找
+	funcs  template.FuncMap
+	strict bool
+	hooks  []Hook
 	hasHook atomic.Bool
 
 	// cache: sign (string) -> *template.Template（已完成特征码包装）
 	cache sync.Map
+}
+
+// source 是带标签的查找来源，读取失败时用于错误定位。
+type source struct {
+	name string
+	fsys fs.FS
+}
+
+// Funcs 注册调用方模板函数（如 i18n 翻译器），可在页面特征码中调用：
+//
+//	eng.Funcs(template.FuncMap{"T": translator})
+//	页面: {"title": "{{T `标题` | json}}"}
+//
+// 链式设置，返回引擎自身。与内置函数（json、include）同名时以内置函数为准。
+func (e *Engine) Funcs(funcs template.FuncMap) *Engine {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.funcs == nil {
+		e.funcs = template.FuncMap{}
+	}
+	for name, fn := range funcs {
+		e.funcs[name] = fn
+	}
+	return e
+}
+
+// Strict 开启严格寻址模式：查找只按完整路径精确命中，禁用同名层级回退链
+// （"user/list" 不再回退 "list"）。适合「sign 即权限路径」的场景，避免
+// 权限路径被低层级同名模板意外命中。链式设置，返回引擎自身。
+func (e *Engine) Strict() *Engine {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.strict = true
+	return e
 }
 
 // New 创建引擎。
@@ -124,34 +168,91 @@ func fallbackPaths(sign string) []string {
 	return out
 }
 
-// lookup 查找页面文件：回退链中每个候选路径（完整路径最优先）
-// 都先在全部来源（本地根目录 -> fs 注册顺序）中查找，未命中再回退下一层级。
+// sourcesSnapshot 返回当前查找来源列表（本地根目录最优先，随后按注册顺序），
+// 以及严格寻址开关状态。
+func (e *Engine) sourcesSnapshot() (sources []source, strict bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.root != nil {
+		sources = append(sources, source{name: "local", fsys: e.root})
+	}
+	for i, f := range e.fss {
+		sources = append(sources, source{name: fmt.Sprintf("fs%d", i), fsys: f})
+	}
+	return sources, e.strict
+}
+
+// lookup 查找页面文件。
+//
+// 常规模式：回退链中每个候选路径（完整路径最优先，逐级去掉前导目录段）
+// 都先在全部来源中查找，未命中再回退下一层级。
+// 严格模式（Strict）：只按完整路径精确命中。
+//
+// 读取遵循 fail-fast：来源中文件存在但读取失败（错误并非「不存在」）时
+// 直接报错并携带来源标签，SHALL NOT 静默跳过该来源——否则陈旧副本会
+// 悄悄顶上，「页面改了不生效」将无法排查。只有确定「不存在」才继续下一
+// 来源；全部未命中时返回包装 ErrNotFound 的错误。
 func (e *Engine) lookup(sign string) ([]byte, error) {
-	if _, err := pageFile(sign); err != nil {
+	file, err := pageFile(sign)
+	if err != nil {
 		return nil, err
 	}
-	candidates := fallbackPaths(sign)
+	sources, strict := e.sourcesSnapshot()
 
-	e.mu.RLock()
-	root, fss := e.root, e.fss
-	e.mu.RUnlock()
-
-	sources := make([]fs.FS, 0, len(fss)+1)
-	if root != nil {
-		sources = append(sources, root)
+	candidates := []string{file}
+	if !strict {
+		candidates = fallbackPaths(sign)
 	}
-	sources = append(sources, fss...)
 
 	for _, file := range candidates {
 		for _, src := range sources {
-			if src == nil {
-				continue
-			}
-			b, err := fs.ReadFile(src, file)
+			b, err := fs.ReadFile(src.fsys, file)
 			if err == nil {
 				return b, nil
 			}
+			if !errors.Is(err, fs.ErrNotExist) {
+				return nil, fmt.Errorf("amisgo: 读取页面文件 %q（来源 %s）失败: %w", file, src.name, err)
+			}
 		}
 	}
-	return nil, fmt.Errorf("amisgo: 页面 %q 未找到（已尝试 %v）", sign, candidates)
+	return nil, fmt.Errorf("%w: 页面 %q 未找到（已尝试 %v）", ErrNotFound, sign, candidates)
+}
+
+// Validate 对全部页面做启动期校验：按来源优先级枚举每个 <sign>.json
+//（同一 sign 只校验优先级最高的来源，低优先级来源中的同名页面因被遮蔽
+// 不会实际参与查找），逐个以 nil data 完整渲染（编译 + 执行 + JSON 解码），
+// 任一页面失败即返回包含 sign 与来源标签的错误。
+//
+// 用于服务启动期 fail-fast，把页面语法错误挡在上线前。注意：页面若依赖
+// data 才能完成渲染（如经 include 变量动态组合布局），静态校验可能误报。
+func (e *Engine) Validate() error {
+	sources, _ := e.sourcesSnapshot()
+
+	claimed := map[string]string{} // sign -> 首个声明它的来源名
+	for _, src := range sources {
+		err := fs.WalkDir(src.fsys, ".", func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				if p == "." && errors.Is(err, fs.ErrNotExist) {
+					return fs.SkipAll // 来源整体不存在：视为空来源
+				}
+				return fmt.Errorf("amisgo: 遍历来源 %s 失败: %w", src.name, err)
+			}
+			if d.IsDir() || !strings.HasSuffix(p, ".json") {
+				return nil
+			}
+			sign := strings.TrimSuffix(p, ".json")
+			if _, ok := claimed[sign]; ok {
+				return nil // 已被更高优先级来源声明，本来源的同名页面被遮蔽
+			}
+			claimed[sign] = src.name
+			if _, err := e.Render(context.Background(), sign, nil); err != nil {
+				return fmt.Errorf("amisgo: 校验页面 %q（来源 %s）失败: %w", sign, src.name, err)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -40,13 +40,22 @@ func encodeJSON(v any) (string, error) {
 //	{{.x | json}}                 值注入（JSON 编码，保证合法性）
 //	{{include `sign` .}}          以当前上下文为 data 加载其他模板
 //	{{include `sign` .sub}}       以显式 data 加载其他模板
+//	{{T `标题` | json}}           调用方经 Funcs 注册的自定义函数
+//
+// 用户函数先注册、内置函数后注册：与内置函数同名时以内置函数为准。
 func compile(e *Engine, name string, src []byte) (*template.Template, error) {
-	t := template.New(name).
-		Delims(`"{{`, `}}"`).
-		Funcs(template.FuncMap{
-			jsonFuncName:    encodeJSON,
-			includeFuncName: e.includeFunc,
-		})
+	e.mu.RLock()
+	userFuncs := e.funcs
+	e.mu.RUnlock()
+
+	t := template.New(name).Delims(`"{{`, `}}"`)
+	if len(userFuncs) > 0 {
+		t = t.Funcs(userFuncs)
+	}
+	t = t.Funcs(template.FuncMap{
+		jsonFuncName:    encodeJSON,
+		includeFuncName: e.includeFunc,
+	})
 	t, err := t.Parse(string(src))
 	if err != nil {
 		return nil, fmt.Errorf("amisgo: 解析页面 %q 失败: %w", name, err)

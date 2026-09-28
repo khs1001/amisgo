@@ -11,8 +11,13 @@ Go 通用 [amis](https://aisuda.bce.baidu.com/amis/) 页面渲染引擎：将本
 - **类型保真注入**：经 `| json` 编码后，数字、字符串、布尔、对象、数组按真实类型注入，而非字符串拼接
 - **缺失安全**：变量缺失或为 `nil` 时输出 `null`；`data` 为 `nil` 也照常渲染
 - **多来源查找**：本地根目录最优先，随后按注册顺序查找 `fs.FS` 列表（`embed.FS`、`os.DirFS` 等均可）
+- **fail-fast 查找**：来源中文件存在但读取失败（错误并非「不存在」）时直接报错并携带来源标签，绝不静默跳过该来源；只有确定不存在才继续下一来源
+- **哨兵错误**：全部来源未命中时返回包装 `ErrNotFound` 的错误，调用方经 `errors.Is` 程序化区分「无此页面」（如 404）与「页面存在但坏了」（如 500）
+- **严格寻址模式**：`Strict()` 关闭同名层级回退链，只按完整路径精确命中，适合「sign 即权限路径」的场景
 - **同名层级回退**：完整路径未命中时逐级回退短名称（`user/list` → `list`），短名称即通用模板
 - **include 与布局模式**：内置 `include` 函数加载其他模板（对象注入、支持嵌套与循环引用防护），布局模式通过 include 组合实现（参考 GoFrame gview）
+- **自定义模板函数**：`Funcs` 注册调用方函数（如 i18n 翻译器 `{{T `标题` | json}}`），与内置函数同名时以内置函数为准
+- **启动期全量校验**：`Validate` 按来源优先级枚举全部页面并以 nil data 完整渲染，任一页面失败即报错（含 sign 与来源标签），服务启动期 fail-fast
 - **路径安全**：拒绝 `..`、绝对路径、反斜杠等非法 `sign`，防路径穿越
 - **进程内缓存**：模板与基准渲染页缓存复用，重启刷新
 - **零拷贝共享页**：渲染输出与基准一致时直接返回缓存中的共享页面（只读约定）
@@ -105,6 +110,26 @@ eng.RegisterFS(os.DirFS("./more")) // 再次查找其他 fs
 ### `func (e *Engine) RegisterFS(fsys fs.FS)`
 
 追加备用文件系统，查找顺序位于本地根目录之后、按注册顺序依次匹配。
+
+### `func (e *Engine) Funcs(funcs template.FuncMap) *Engine`
+
+注册调用方模板函数，可在页面特征码中调用（链式设置）：
+
+```go
+eng := amisgo.New("./pages").Funcs(template.FuncMap{
+    "T": translator, // 页面: {"title": "{{T `标题` | json}}"}
+})
+```
+
+与内置函数（`json`、`include`）同名时以内置函数为准。应在首次 `Render` 前调用完成。
+
+### `func (e *Engine) Strict() *Engine`
+
+开启严格寻址模式（链式设置）：查找只按完整路径精确命中，禁用同名层级回退链——`"user/list"` 不再回退 `"list"`。适合「sign 即权限路径」的场景，避免权限路径被低层级同名模板意外命中。
+
+### `func (e *Engine) Validate() error`
+
+启动期全量校验：按来源优先级枚举每个 `<sign>.json`（同一 sign 只校验优先级最高的来源，被遮蔽的同名页面不参与校验），逐个以 nil data 完整渲染（编译 + 执行 + JSON 解码），任一页面失败即返回包含 sign 与来源标签的错误。注意：依赖 data 才能完成渲染的页面（如经 include 变量动态组合布局）静态校验可能误报。
 
 ### `func (e *Engine) AddHook(h Hook)`
 
